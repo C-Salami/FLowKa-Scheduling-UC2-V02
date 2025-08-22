@@ -29,6 +29,22 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ----------------------------
+# Helpers
+# ----------------------------
+def ensure_app_tz(series: pd.Series) -> pd.Series:
+    """
+    Parse a Series to datetime then ensure it is tz-aware in APP_TZ.
+    - If tz-naive -> tz_localize(APP_TZ)
+    - If tz-aware -> tz_convert(APP_TZ)
+    """
+    s = pd.to_datetime(series, errors="coerce")
+    if getattr(s.dt, "tz", None) is None:
+        s = s.dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT")
+    else:
+        s = s.dt.tz_convert(APP_TZ)
+    return s
+
+# ----------------------------
 # Demo data loader (adapter)
 # Replace this with your zip’s loading function if available.
 # ----------------------------
@@ -57,34 +73,10 @@ def load_plan_dataframe():
 
     # 2) Normalize datetime columns (parse → localize/convert)
     for col in ["start", "finish"]:
-        s = pd.to_datetime(df[col], errors="coerce")
-
-        # If tz-naive → localize to app tz; if tz-aware → convert to app tz
-        if getattr(s.dt, "tz", None) is None:
-            s = s.dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT")
-        else:
-            s = s.dt.tz_convert(APP_TZ)
-
-        df[col] = s
+        df[col] = ensure_app_tz(df[col])
 
     st.session_state.plan_df = df
     return df
-
-    # Normalize types
-# Normalize types (pandas 2.2+: use errors only on to_datetime, not tz_localize)
-for col in ["start", "finish"]:
-    # Parse to datetime first
-    s = pd.to_datetime(df[col], errors="coerce")
-
-    # If the series has no timezone (naive), localize to app tz.
-    # If any entries are already tz-aware, convert those to app tz.
-    if getattr(s.dt, "tz", None) is None:
-        s = s.dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT")
-    else:
-        s = s.dt.tz_convert(APP_TZ)
-
-    df[col] = s
-
 
 # ----------------------------
 # Undo/Redo stacks
@@ -103,17 +95,18 @@ def snapshot():
     st.session_state.future.clear()
 
 def restore_from(payload):
-    st.session_state.plan_df = pd.DataFrame(payload)
-    # ensure tz-aware
+    df = pd.DataFrame(payload)
     for col in ["start", "finish"]:
-        st.session_state.plan_df[col] = pd.to_datetime(st.session_state.plan_df[col]).dt.tz_convert(APP_TZ)
+        df[col] = ensure_app_tz(df[col])
+    st.session_state.plan_df = df
 
 def do_undo(steps=1):
     if not st.session_state.history:
         return False
     current = st.session_state.plan_df.to_dict(orient="records")
     for _ in range(steps):
-        if not st.session_state.history: break
+        if not st.session_state.history:
+            break
         prev = st.session_state.history.pop()
         st.session_state.future.append(current)
         restore_from(prev)
@@ -125,7 +118,8 @@ def do_redo(steps=1):
         return False
     current = st.session_state.plan_df.to_dict(orient="records")
     for _ in range(steps):
-        if not st.session_state.future: break
+        if not st.session_state.future:
+            break
         nxt = st.session_state.future.pop()
         st.session_state.history.append(current)
         restore_from(nxt)
@@ -225,7 +219,7 @@ def build_context_snapshot(df: pd.DataFrame):
     }
     return {"orders": orders, "resources": resources, "bounds": bounds, "today": str(TODAY)}
 
-def interpret_with_llm(transcript: str, context_snapshot: dict) -> list[dict]:
+def interpret_with_llm(transcript: str, context_snapshot: dict):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT.format(today=str(TODAY))},
         {"role": "user", "content": f"Context: {json.dumps(context_snapshot)}"},
@@ -282,7 +276,7 @@ def render_gantt(df: pd.DataFrame):
     fig.update_yaxes(autorange="reversed")
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
 
-def apply_operations(ops: list[dict]) -> list[str]:
+def apply_operations(ops) -> list:
     """
     Apply a list of operations atomically (simple version).
     Returns a list of human-readable summaries for the toast/log.
@@ -298,11 +292,15 @@ def apply_operations(ops: list[dict]) -> list[str]:
             if t == "move_order_by":
                 oid = op["orderId"]
                 delta = op.get("delta", {})
-                move_order_by(oid,
-                              delta_days=int(delta.get("days", 0)),
-                              delta_hours=int(delta.get("hours", 0)),
-                              delta_minutes=int(delta.get("minutes", 0)))
-                msgs.append(f"Moved {oid} by {delta.get('days',0)}d {delta.get('hours',0)}h {delta.get('minutes',0)}m")
+                move_order_by(
+                    oid,
+                    delta_days=int(delta.get("days", 0)),
+                    delta_hours=int(delta.get("hours", 0)),
+                    delta_minutes=int(delta.get("minutes", 0)),
+                )
+                msgs.append(
+                    f"Moved {oid} by {delta.get('days',0)}d {delta.get('hours',0)}h {delta.get('minutes',0)}m"
+                )
 
             elif t == "move_order_to":
                 oid = op["orderId"]
@@ -313,12 +311,16 @@ def apply_operations(ops: list[dict]) -> list[str]:
             elif t == "shift_range_by":
                 fdict = op.get("filter", {})
                 delta = op.get("delta", {})
-                shift_range_by(fdict,
-                               delta_days=int(delta.get("days", 0)),
-                               delta_hours=int(delta.get("hours", 0)),
-                               delta_minutes=int(delta.get("minutes", 0)))
-                msgs.append("Shifted range by "
-                            f"{delta.get('days',0)}d {delta.get('hours',0)}h {delta.get('minutes',0)}m")
+                shift_range_by(
+                    fdict,
+                    delta_days=int(delta.get("days", 0)),
+                    delta_hours=int(delta.get("hours", 0)),
+                    delta_minutes=int(delta.get("minutes", 0)),
+                )
+                msgs.append(
+                    "Shifted range by "
+                    f"{delta.get('days',0)}d {delta.get('hours',0)}h {delta.get('minutes',0)}m"
+                )
 
             elif t == "undo":
                 steps = int(op.get("steps", 1))
@@ -360,12 +362,14 @@ with st.sidebar:
             st.info("Nothing to redo.")
     st.divider()
     st.markdown("**What can I say?**")
-    st.code('''
+    st.code(
+        '''
 "move Order O023 by one day"
 "move O023 to Aug 25 09:00"
 "shift all on Line A today by 2 hours"
 "undo"
-'''.strip())
+'''.strip()
+    )
 
 init_history()
 df = load_plan_dataframe()
@@ -382,7 +386,7 @@ audio = mic_recorder(
     key="mic",
 )
 
-col1, col2 = st.columns([1,1])
+col1, col2 = st.columns([1, 1])
 
 with col1:
     transcript_area = st.empty()
@@ -435,4 +439,3 @@ if st.button("Interpret (typed)"):
             ops_area.json({"operations": ops})
         except Exception as e:
             st.error(f"Could not interpret: {e}")
-
