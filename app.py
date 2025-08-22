@@ -1,6 +1,9 @@
 import os
 import io
 import json
+import time
+import random
+import hashlib
 import tempfile
 from datetime import datetime, timedelta
 from dateutil import tz, parser as dtparser
@@ -12,7 +15,7 @@ import plotly.express as px
 import soundfile as sf
 import streamlit as st
 from streamlit_mic_recorder import mic_recorder
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 # ----------------------------
 # Config & globals
@@ -26,7 +29,56 @@ if not OPENAI_API_KEY:
     st.error("Missing OPENAI_API_KEY. Set it in .streamlit/secrets.toml")
     st.stop()
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# cache the client (one per process)
+@st.cache_resource(show_spinner=False)
+def get_openai_client(key: str):
+    return OpenAI(api_key=key)
+
+client = get_openai_client(OPENAI_API_KEY)
+
+# simple in-app cooldown (guards accidental double submissions)
+COOLDOWN_SECONDS = 3.0
+if "last_api_call_ts" not in st.session_state:
+    st.session_state.last_api_call_ts = 0.0
+
+def gate_api_call() -> bool:
+    now = time.time()
+    if now - st.session_state.last_api_call_ts < COOLDOWN_SECONDS:
+        return False
+    st.session_state.last_api_call_ts = now
+    return True
+
+# ----------------------------
+# Retry helpers (exponential backoff with jitter)
+# ----------------------------
+def with_retries(fn, *args, _max_attempts=4, _base=1.2, _jitter=0.4, **kwargs):
+    """
+    Calls fn with retries on RateLimitError and transient 5xx-type errors.
+    Backoff: base * 2^attempt + jitter
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except RateLimitError as e:
+            attempt += 1
+            if attempt >= _max_attempts:
+                raise
+            delay = _base * (2 ** (attempt - 1)) + random.uniform(0, _jitter)
+            st.info(f"OpenAI is a bit busy (rate limit). Retrying in {delay:.1f}s…")
+            time.sleep(delay)
+        except Exception as e:
+            # Retry only for likely-transient server/network issues
+            msg = str(e).lower()
+            transient = any(t in msg for t in ["timeout", "temporarily", "server error", "503", "502", "504"])
+            if not transient:
+                raise
+            attempt += 1
+            if attempt >= _max_attempts:
+                raise
+            delay = _base * (2 ** (attempt - 1)) + random.uniform(0, _jitter)
+            st.info(f"Temporary issue. Retrying in {delay:.1f}s…")
+            time.sleep(delay)
 
 # ----------------------------
 # Helpers
@@ -210,7 +262,6 @@ Rules:
 """
 
 def build_context_snapshot(df: pd.DataFrame):
-    # Small index of known entities to guide the model
     resources = sorted(df["resource"].dropna().unique().tolist())
     orders = df["id"].tolist()
     bounds = {
@@ -219,18 +270,22 @@ def build_context_snapshot(df: pd.DataFrame):
     }
     return {"orders": orders, "resources": resources, "bounds": bounds, "today": str(TODAY)}
 
-def interpret_with_llm(transcript: str, context_snapshot: dict):
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_interpret(transcript: str, context_snapshot_json: str):
+    # Use JSON string for stable hashing of dict input
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT.format(today=str(TODAY))},
-        {"role": "user", "content": f"Context: {json.dumps(context_snapshot)}"},
+        {"role": "user", "content": f"Context: {context_snapshot_json}"},
         {"role": "user", "content": f'Command: """{transcript}"""'},
     ]
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
+    def _call():
+        return client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+    resp = with_retries(_call)
     content = resp.choices[0].message.content
     data = json.loads(content)
     ops = data.get("operations", [])
@@ -238,28 +293,38 @@ def interpret_with_llm(transcript: str, context_snapshot: dict):
         raise ValueError("LLM did not return a valid operations array.")
     return ops
 
+def interpret_with_llm(transcript: str, context_snapshot: dict):
+    ctx_json = json.dumps(context_snapshot, separators=(",", ":"))
+    return cached_interpret(transcript, ctx_json)
+
 # ----------------------------
-# Whisper transcription
+# Whisper transcription (cached + retries)
 # ----------------------------
-def transcribe_with_whisper(wav_bytes: bytes, language_hint: str | None = None) -> dict:
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_transcribe(wav_bytes: bytes, language_hint: str | None):
     # Save to a NamedTemporaryFile for the SDK
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(wav_bytes)
         tmp.flush()
         tmp_path = tmp.name
     try:
-        with open(tmp_path, "rb") as f:
-            tr = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language=language_hint  # None lets Whisper autodetect
-            )
+        def _call():
+            with open(tmp_path, "rb") as f:
+                return client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language=language_hint  # None lets Whisper autodetect
+                )
+        tr = with_retries(_call)
         return {"text": tr.text}
     finally:
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+
+def transcribe_with_whisper(wav_bytes: bytes, language_hint: str | None = None) -> dict:
+    return cached_transcribe(wav_bytes, language_hint)
 
 # ----------------------------
 # UI helpers
@@ -283,7 +348,6 @@ def apply_operations(ops) -> list:
     """
     if not ops:
         return ["No operations to apply."]
-    # Snapshot for undo
     snapshot()
     msgs = []
     try:
@@ -336,8 +400,7 @@ def apply_operations(ops) -> list:
                 raise ValueError(f"Unknown operation type: {t}")
         return msgs
     except Exception as e:
-        # Roll back if something fails by undoing the snapshot we just pushed
-        do_undo(1)
+        do_undo(1)  # rollback snapshot
         raise e
 
 # ----------------------------
@@ -377,6 +440,7 @@ render_gantt(df)
 
 st.markdown("#### Speak a command")
 st.caption("Click to record, click again to stop. Review the transcript, then Apply.")
+
 audio = mic_recorder(
     start_prompt="Start recording",
     stop_prompt="Stop",
@@ -396,35 +460,49 @@ with col2:
 transcript_text = ""
 
 if audio and isinstance(audio, dict) and audio.get("bytes"):
-    # audio["bytes"] is raw WAV bytes from the component
-    wav_bytes = audio["bytes"]
+    if not gate_api_call():
+        st.info("Please wait a moment before submitting another command.")
+    else:
+        # audio["bytes"] is raw WAV bytes from the component
+        wav_bytes = audio["bytes"]
 
-    # Ensure valid WAV by decoding/encoding once via soundfile
-    data, samplerate = sf.read(io.BytesIO(wav_bytes))
-    buf = io.BytesIO()
-    sf.write(buf, data, samplerate, format="WAV")
-    clean_wav_bytes = buf.getvalue()
+        # Ensure valid WAV by decoding/encoding once via soundfile
+        try:
+            data, samplerate = sf.read(io.BytesIO(wav_bytes))
+            buf = io.BytesIO()
+            sf.write(buf, data, samplerate, format="WAV")
+            clean_wav_bytes = buf.getvalue()
+        except Exception:
+            # If decoding fails, still try the original bytes
+            clean_wav_bytes = wav_bytes
 
-    with st.spinner("Transcribing with Whisper..."):
-        tr = transcribe_with_whisper(clean_wav_bytes, None if lang == "auto" else lang)
-        transcript_text = tr["text"].strip()
-        transcript_area.text_area("Transcript", transcript_text, height=120)
-
-    if transcript_text:
-        with st.spinner("Interpreting command..."):
-            ctx = build_context_snapshot(st.session_state.plan_df)
+        with st.spinner("Transcribing with Whisper…"):
             try:
-                ops = interpret_with_llm(transcript_text, ctx)
-                ops_area.json({"operations": ops})
-                if st.button("Apply to plan", type="primary"):
-                    try:
-                        msgs = apply_operations(ops)
-                        st.success(" | ".join(msgs))
-                        render_gantt(st.session_state.plan_df)
-                    except Exception as e:
-                        st.error(str(e))
+                tr = transcribe_with_whisper(clean_wav_bytes, None if lang == "auto" else lang)
+                transcript_text = tr["text"].strip()
+                transcript_area.text_area("Transcript", transcript_text, height=120)
+            except RateLimitError:
+                st.error("We hit the Whisper rate limit. Please wait a few seconds and try again.")
             except Exception as e:
-                st.error(f"Could not interpret the command: {e}")
+                st.error(f"Transcription failed: {e}")
+
+        if transcript_text:
+            with st.spinner("Interpreting command…"):
+                ctx = build_context_snapshot(st.session_state.plan_df)
+                try:
+                    ops = interpret_with_llm(transcript_text, ctx)
+                    ops_area.json({"operations": ops})
+                    if st.button("Apply to plan", type="primary"):
+                        try:
+                            msgs = apply_operations(ops)
+                            st.success(" | ".join(msgs))
+                            render_gantt(st.session_state.plan_df)
+                        except Exception as e:
+                            st.error(str(e))
+                except RateLimitError:
+                    st.error("We hit the Chat rate limit. Please wait a few seconds and try again.")
+                except Exception as e:
+                    st.error(f"Could not interpret the command: {e}")
 
 # Manual testing without mic
 st.markdown("#### Or type a command (debug)")
@@ -433,9 +511,14 @@ if st.button("Interpret (typed)"):
     if not manual.strip():
         st.warning("Type something first.")
     else:
-        ctx = build_context_snapshot(st.session_state.plan_df)
-        try:
-            ops = interpret_with_llm(manual.strip(), ctx)
-            ops_area.json({"operations": ops})
-        except Exception as e:
-            st.error(f"Could not interpret: {e}")
+        if not gate_api_call():
+            st.info("Please wait a moment before submitting another command.")
+        else:
+            ctx = build_context_snapshot(st.session_state.plan_df)
+            try:
+                ops = interpret_with_llm(manual.strip(), ctx)
+                ops_area.json({"operations": ops})
+            except RateLimitError:
+                st.error("We hit the Chat rate limit. Please wait a few seconds and try again.")
+            except Exception as e:
+                st.error(f"Could not interpret: {e}")
