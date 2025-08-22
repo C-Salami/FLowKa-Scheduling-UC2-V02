@@ -34,18 +34,14 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ----------------------------
 def load_plan_dataframe():
     """
+    Returns a tz-aware plan DataFrame in app timezone.
     Expected columns: id, start, finish, resource
-    start/finish must be ISO strings or pandas Timestamps (timezone-aware).
     """
     if "plan_df" in st.session_state:
         return st.session_state.plan_df
 
-    # Try to load from a known CSV path to match your project layout,
-    # otherwise seed a tiny demo.
-    csv_candidates = [
-        "data/orders.csv",
-        "orders.csv",
-    ]
+    # 1) Load (CSV or demo seed)
+    csv_candidates = ["data/orders.csv", "orders.csv"]
     for path in csv_candidates:
         if os.path.exists(path):
             df = pd.read_csv(path)
@@ -56,8 +52,23 @@ def load_plan_dataframe():
             {"id": "O021", "start": base + timedelta(hours=8),  "finish": base + timedelta(hours=12), "resource": "Line A"},
             {"id": "O022", "start": base + timedelta(hours=13), "finish": base + timedelta(hours=18), "resource": "Line A"},
             {"id": "O023", "start": base + timedelta(hours=9),  "finish": base + timedelta(hours=15), "resource": "Line B"},
-            {"id": "O024", "start": base + timedelta(days=1, hours=8),  "finish": base + timedelta(days=1, hours=12), "resource": "Line B"},
+            {"id": "O024", "start": base + timedelta(days=1, hours=8), "finish": base + timedelta(days=1, hours=12), "resource": "Line B"},
         ])
+
+    # 2) Normalize datetime columns (parse → localize/convert)
+    for col in ["start", "finish"]:
+        s = pd.to_datetime(df[col], errors="coerce")
+
+        # If tz-naive → localize to app tz; if tz-aware → convert to app tz
+        if getattr(s.dt, "tz", None) is None:
+            s = s.dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT")
+        else:
+            s = s.dt.tz_convert(APP_TZ)
+
+        df[col] = s
+
+    st.session_state.plan_df = df
+    return df
 
     # Normalize types
 # Normalize types (pandas 2.2+: use errors only on to_datetime, not tz_localize)
