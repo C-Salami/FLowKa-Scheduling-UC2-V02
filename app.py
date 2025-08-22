@@ -60,17 +60,20 @@ def load_plan_dataframe():
         ])
 
     # Normalize types
-    for col in ["start", "finish"]:
-        if df[col].dtype == object:
-            df[col] = pd.to_datetime(df[col]).dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT", errors="coerce").fillna(
-                pd.to_datetime(df[col], utc=True).dt.tz_convert(APP_TZ)
-            )
-        else:
-            # assume naive -> localize
-            df[col] = pd.to_datetime(df[col]).dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT", errors="coerce")
+# Normalize types (pandas 2.2+: use errors only on to_datetime, not tz_localize)
+for col in ["start", "finish"]:
+    # Parse to datetime first
+    s = pd.to_datetime(df[col], errors="coerce")
 
-    st.session_state.plan_df = df
-    return df
+    # If the series has no timezone (naive), localize to app tz.
+    # If any entries are already tz-aware, convert those to app tz.
+    if getattr(s.dt, "tz", None) is None:
+        s = s.dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT")
+    else:
+        s = s.dt.tz_convert(APP_TZ)
+
+    df[col] = s
+
 
 # ----------------------------
 # Undo/Redo stacks
