@@ -1,523 +1,424 @@
 import os
+import io
 import json
-import re
-from datetime import timedelta
-import pytz
-from dateutil import parser as dtp
+import tempfile
+from datetime import datetime, timedelta
+from dateutil import tz, parser as dtparser
+from dateutil.relativedelta import relativedelta
 
-import streamlit as st
+import numpy as np
 import pandas as pd
-import altair as alt
+import plotly.express as px
+import soundfile as sf
+import streamlit as st
+from streamlit_mic_recorder import mic_recorder
+from openai import OpenAI
 
-# ============================ PAGE & SECRETS ============================
-st.set_page_config(page_title="Scooter Wheels Scheduler", layout="wide")
+# ----------------------------
+# Config & globals
+# ----------------------------
+st.set_page_config(page_title="Voice → Gantt", layout="wide")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY"))
+APP_TZ = tz.gettz(st.secrets.get("TZ", "Asia/Makassar"))
+TODAY = datetime.now(APP_TZ).date()
 
-# Pull OPENAI key from Streamlit secrets if available (TOML: OPENAI_API_KEY = "sk-...")
-try:
-    os.environ["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY") or st.secrets["OPENAI_API_KEY"]
-except Exception:
-    pass  # fine; we'll fall back to regex if no key
+if not OPENAI_API_KEY:
+    st.error("Missing OPENAI_API_KEY. Set it in .streamlit/secrets.toml")
+    st.stop()
 
-# ============================ DATA LOADING =============================
-@st.cache_data
-def load_data():
-    orders = pd.read_csv("data/scooter_orders.csv", parse_dates=["due_date"])
-    sched = pd.read_csv("data/scooter_schedule.csv", parse_dates=["start", "end", "due_date"])
-    return orders, sched
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-orders, base_schedule = load_data()
-
-# Working schedule in session (so edits persist)
-if "schedule_df" not in st.session_state:
-    st.session_state.schedule_df = base_schedule.copy()
-
-# ============================ FILTER & LOG STATE =======================
-if "filters_open" not in st.session_state:
-    st.session_state.filters_open = True
-if "filt_max_orders" not in st.session_state:
-    st.session_state.filt_max_orders = 12
-if "filt_wheels" not in st.session_state:
-    st.session_state.filt_wheels = sorted(base_schedule["wheel_type"].unique().tolist())
-if "filt_machines" not in st.session_state:
-    st.session_state.filt_machines = sorted(base_schedule["machine"].unique().tolist())
-if "cmd_log" not in st.session_state:
-    st.session_state.cmd_log = []  # rolling debug log
-
-# ============================ CSS / LAYOUT =============================
-sidebar_display = "block" if st.session_state.filters_open else "none"
-st.markdown(f"""
-<style>
-/* Sidebar fully removed when hidden so chart uses full width */
-[data-testid="stSidebar"] {{ display: {sidebar_display}; }}
-
-/* Top bar */
-.topbar {{
-  position: sticky; top: 0; z-index: 100;
-  background: #fff; border-bottom: 1px solid #eee;
-  padding: 8px 10px; margin-bottom: 6px;
-}}
-.topbar .inner {{ display: flex; justify-content: space-between; align-items: center; }}
-.topbar .title {{ font-weight: 600; font-size: 16px; }}
-.topbar .btn {{
-  background: #000; color: #fff; border: none; border-radius: 8px;
-  padding: 6px 12px; font-weight: 600; cursor: pointer;
-}}
-.topbar .btn:hover {{ opacity: 0.9; }}
-
-/* Tighten spacing and leave room for chat input at bottom */
-.block-container {{ padding-top: 6px; padding-bottom: 64px; }}
-
-/* Hide Streamlit default footer/menu */
-#MainMenu, footer {{ visibility: hidden; }}
-</style>
-""", unsafe_allow_html=True)
-
-# ============================ TOP BAR =============================
-st.markdown('<div class="topbar"><div class="inner">', unsafe_allow_html=True)
-st.markdown('<div class="title">Scooter Wheels Scheduler</div>', unsafe_allow_html=True)
-toggle_label = "Hide Filters" if st.session_state.filters_open else "Show Filters"
-if st.button(toggle_label, key="toggle_filters_btn"):
-    st.session_state.filters_open = not st.session_state.filters_open
-    st.rerun()
-st.markdown('</div></div>', unsafe_allow_html=True)
-
-# ============================ SIDEBAR FILTERS =========================
-if st.session_state.filters_open:
-    with st.sidebar:
-        st.header("Filters ⚙️")
-        st.session_state.filt_max_orders = st.number_input(
-            "Orders", 1, 100, value=st.session_state.filt_max_orders, step=1, key="num_orders"
-        )
-        wheels_all = sorted(base_schedule["wheel_type"].unique().tolist())
-        st.session_state.filt_wheels = st.multiselect(
-            "Wheel", wheels_all, default=st.session_state.filt_wheels or wheels_all, key="wheel_ms"
-        )
-        machines_all = sorted(base_schedule["machine"].unique().tolist())
-        st.session_state.filt_machines = st.multiselect(
-            "Machine", machines_all, default=st.session_state.filt_machines or machines_all, key="machine_ms"
-        )
-        if st.button("Reset filters", key="reset_filters"):
-            st.session_state.filt_max_orders = 12
-            st.session_state.filt_wheels = wheels_all
-            st.session_state.filt_machines = machines_all
-            st.rerun()
-
-        # ---- Debug panel in sidebar ----
-        with st.expander("🔎 Debug (last commands)"):
-            if st.session_state.cmd_log:
-                last = st.session_state.cmd_log[-1]
-                st.markdown("**Last payload:**")
-                st.json(last["payload"])
-                st.markdown(
-                    f"- **OK:** {last['ok']}   \n"
-                    f"- **Message:** {last['msg']}   \n"
-                    f"- **Source:** {last.get('source','?')}   \n"
-                    f"- **Raw:** `{last['raw']}`"
-                )
-                mini = [
-                    {
-                        "raw": e["raw"],
-                        "intent": e["payload"].get("intent", "?"),
-                        "ok": e["ok"],
-                        "msg": e["msg"],
-                        "source": e.get("source", "?"),
-                    }
-                    for e in st.session_state.cmd_log[-10:]
-                ]
-                st.dataframe(pd.DataFrame(mini), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No commands yet.")
-
-# Effective filter values (work even when sidebar hidden)
-max_orders = int(st.session_state.filt_max_orders)
-wheel_choice = st.session_state.filt_wheels or sorted(base_schedule["wheel_type"].unique().tolist())
-machine_choice = st.session_state.filt_machines or sorted(base_schedule["machine"].unique().tolist())
-
-# ============================ NLP / INTELLIGENCE (INLINE) =========================
-INTENT_SCHEMA = {  # kept for reference; used if you enable OpenAI path
-  "type": "object",
-  "properties": {
-    "intent": {"type": "string", "enum": ["delay_order", "move_order", "swap_orders"]},
-    "order_id": {"type": "string", "pattern": "^O\\d{3}$"},
-    "order_id_2": {"type": "string", "pattern": "^O\\d{3}$"},
-    "days": {"type": "number"},
-    "hours": {"type": "number"},
-    "minutes": {"type": "number"},
-    "date": {"type": "string"},
-    "time": {"type": "string"},
-    "timezone": {"type": "string", "default": "Asia/Makassar"},
-    "note": {"type": "string"}
-  },
-  "required": ["intent"],
-  "additionalProperties": False
-}
-
-DEFAULT_TZ = "Asia/Makassar"
-TZ = pytz.timezone(DEFAULT_TZ)
-
-# --- number words -> float (simple MVP up to 20; supports decimals too) ---
-NUM_WORDS = {
-    "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,
-    "six":6,"seven":7,"eight":8,"nine":9,"ten":10,
-    "eleven":11,"twelve":12,"thirteen":13,"fourteen":14,"fifteen":15,
-    "sixteen":16,"seventeen":17,"eighteen":18,"nineteen":19,"twenty":20
-}
-def _num_token_to_float(tok: str):
-    t = tok.strip().lower().replace("-", " ")
-    t = t.replace(",", ".")  # 1,5 -> 1.5
-    try:
-        return float(t)
-    except Exception:
-        pass
-    parts = [p for p in t.split() if p]
-    if len(parts) == 1 and parts[0] in NUM_WORDS:
-        return float(NUM_WORDS[parts[0]])
-    if len(parts) == 2 and parts[0] in NUM_WORDS and parts[1] in NUM_WORDS:
-        return float(NUM_WORDS[parts[0]] + NUM_WORDS[parts[1]])
-    return None
-
-def _parse_duration_chunks(text: str):
+# ----------------------------
+# Demo data loader (adapter)
+# Replace this with your zip’s loading function if available.
+# ----------------------------
+def load_plan_dataframe():
     """
-    Parses '1h 30m', '90 minutes', '1.5 hours', '2 days', '45m', '75 min'
-    Returns dict like {'days':2,'hours':1,'minutes':30}
+    Expected columns: id, start, finish, resource
+    start/finish must be ISO strings or pandas Timestamps (timezone-aware).
     """
-    d = {"days":0.0,"hours":0.0,"minutes":0.0}
-    for num, unit in re.findall(r"([\d\.,]+|\b\w+\b)\s*(days?|d|hours?|h|minutes?|mins?|m)\b", text, flags=re.I):
-        n = _num_token_to_float(num)
-        if n is None:
-            continue
-        u = unit.lower()
-        if u.startswith("d"): d["days"] += n
-        elif u.startswith("h"): d["hours"] += n
-        else: d["minutes"] += n
-    return d
+    if "plan_df" in st.session_state:
+        return st.session_state.plan_df
 
-def _extract_with_openai(user_text: str):
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    SYSTEM = (
-        "You normalize factory scheduling edit commands for a Gantt. "
-        "Return ONLY JSON matching the given schema. "
-        "Supported intents: delay_order, move_order, swap_orders. "
-        "Order IDs look like O021 (3 digits). "
-        "If user says 'tomorrow' etc., convert to ISO date in Asia/Makassar. "
-        "If time missing on move_order, default 08:00. "
-        "If delay units missing, assume days. You may return minutes too."
-    )
-    USER_GUIDE = (
-        'Examples:\n'
-        '1) "delay O021 one day" -> {"intent":"delay_order","order_id":"O021","days":1}\n'
-        '2) "push order O009 by 1h 30m" -> {"intent":"delay_order","order_id":"O009","hours":1.0,"minutes":30.0}\n'
-        '3) "move o014 to Aug 30 09:13" -> {"intent":"move_order","order_id":"O014","date":"2025-08-30","time":"09:13"}\n'
-        '4) "swap o027 with o031" -> {"intent":"swap_orders","order_id":"O027","order_id_2":"O031"}\n'
-        '5) "advance O008 by two days" -> {"intent":"delay_order","order_id":"O008","days":-2}\n'
-    )
-    resp = client.responses.create(
-        model="gpt-5.1",
-        input=[
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": USER_GUIDE},
-            {"role": "user", "content": user_text},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "Edit", "schema": INTENT_SCHEMA}
-        },
-    )
-    text = resp.output[0].content[0].text
-    data = json.loads(text)
-    data["_source"] = "openai"
-    return data
-
-def _regex_fallback(user_text: str):
-    t = user_text.strip()
-    low = t.lower()
-
-    # --- SWAP: "swap O023 O053" | "swap O023 with O053" | "swap O023 & O053"
-    m = re.search(r"(?:^|\b)(swap|switch)\s+(o\d{3})\s*(?:with|and|&)?\s*(o\d{3})\b", low)
-    if m:
-        return {"intent": "swap_orders", "order_id": m.group(2).upper(), "order_id_2": m.group(3).upper(), "_source": "regex"}
-
-    # --- DELAY synonyms: delay/push/postpone (positive), advance/bring forward/pull in (negative)
-    delay_sign = +1
-    if re.search(r"\b(advance|bring\s+forward|pull\s+in)\b", low):
-        delay_sign = -1
-        low_norm = re.sub(r"\b(advance|bring\s+forward|pull\s+in)\b", "delay", low)
+    # Try to load from a known CSV path to match your project layout,
+    # otherwise seed a tiny demo.
+    csv_candidates = [
+        "data/orders.csv",
+        "orders.csv",
+    ]
+    for path in csv_candidates:
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            break
     else:
-        low_norm = low
+        base = datetime.combine(TODAY, datetime.min.time()).replace(tzinfo=APP_TZ)
+        df = pd.DataFrame([
+            {"id": "O021", "start": base + timedelta(hours=8),  "finish": base + timedelta(hours=12), "resource": "Line A"},
+            {"id": "O022", "start": base + timedelta(hours=13), "finish": base + timedelta(hours=18), "resource": "Line A"},
+            {"id": "O023", "start": base + timedelta(hours=9),  "finish": base + timedelta(hours=15), "resource": "Line B"},
+            {"id": "O024", "start": base + timedelta(days=1, hours=8),  "finish": base + timedelta(days=1, hours=12), "resource": "Line B"},
+        ])
 
-    # Try patterns with explicit "by <duration>"
-    m = re.search(r"(delay|push|postpone)\s+(o\d{3}).*?\bby\b\s+(.+)$", low_norm)
-    if m:
-        oid = m.group(2).upper()
-        dur_text = m.group(3)
-        dur = _parse_duration_chunks(dur_text)
-        if any(v != 0 for v in dur.values()):
-            return {
-                "intent": "delay_order",
-                "order_id": oid,
-                "days": delay_sign * dur["days"],
-                "hours": delay_sign * dur["hours"],
-                "minutes": delay_sign * dur["minutes"],
-                "_source": "regex",
-            }
+    # Normalize types
+    for col in ["start", "finish"]:
+        if df[col].dtype == object:
+            df[col] = pd.to_datetime(df[col]).dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT", errors="coerce").fillna(
+                pd.to_datetime(df[col], utc=True).dt.tz_convert(APP_TZ)
+            )
+        else:
+            # assume naive -> localize
+            df[col] = pd.to_datetime(df[col]).dt.tz_localize(APP_TZ, nonexistent="shift_forward", ambiguous="NaT", errors="coerce")
 
-    # Try patterns without "by", e.g. "delay O076 two days"
-    m = re.search(r"(delay|push|postpone)\s+(o\d{3}).*?(days?|d|hours?|h|minutes?|mins?|m)\b", low_norm)
-    if m:
-        oid = m.group(2).upper()
-        dur = _parse_duration_chunks(low_norm)
-        if any(v != 0 for v in dur.values()):
-            return {
-                "intent": "delay_order",
-                "order_id": oid,
-                "days": delay_sign * dur["days"],
-                "hours": delay_sign * dur["hours"],
-                "minutes": delay_sign * dur["minutes"],
-                "_source": "regex",
-            }
+    st.session_state.plan_df = df
+    return df
 
-    # --- MOVE: "move Oxxx to/on <datetime>"
-    m = re.search(r"(move|set|schedule)\s+(o\d{3})\s+(to|on)\s+(.+)", low)
-    if m:
-        oid = m.group(2).upper()
-        when = m.group(4)
+# ----------------------------
+# Undo/Redo stacks
+# ----------------------------
+def init_history():
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    if "future" not in st.session_state:
+        st.session_state.future = []
+
+def snapshot():
+    # Store a deep copy (as json-serializable)
+    df = st.session_state.plan_df.copy()
+    payload = df.to_dict(orient="records")
+    st.session_state.history.append(payload)
+    st.session_state.future.clear()
+
+def restore_from(payload):
+    st.session_state.plan_df = pd.DataFrame(payload)
+    # ensure tz-aware
+    for col in ["start", "finish"]:
+        st.session_state.plan_df[col] = pd.to_datetime(st.session_state.plan_df[col]).dt.tz_convert(APP_TZ)
+
+def do_undo(steps=1):
+    if not st.session_state.history:
+        return False
+    current = st.session_state.plan_df.to_dict(orient="records")
+    for _ in range(steps):
+        if not st.session_state.history: break
+        prev = st.session_state.history.pop()
+        st.session_state.future.append(current)
+        restore_from(prev)
+        current = prev
+    return True
+
+def do_redo(steps=1):
+    if not st.session_state.future:
+        return False
+    current = st.session_state.plan_df.to_dict(orient="records")
+    for _ in range(steps):
+        if not st.session_state.future: break
+        nxt = st.session_state.future.pop()
+        st.session_state.history.append(current)
+        restore_from(nxt)
+        current = nxt
+    return True
+
+# ----------------------------
+# Scheduling operations (adapter to your existing logic)
+# ----------------------------
+def move_order_by(order_id, delta_days=0, delta_hours=0, delta_minutes=0):
+    df = st.session_state.plan_df
+    mask = df["id"] == order_id
+    if not mask.any():
+        raise ValueError(f"Order {order_id} not found.")
+    delta = relativedelta(days=delta_days, hours=delta_hours, minutes=delta_minutes)
+    df.loc[mask, "start"] = df.loc[mask, "start"].apply(lambda x: x + delta)
+    df.loc[mask, "finish"] = df.loc[mask, "finish"].apply(lambda x: x + delta)
+
+def move_order_to(order_id, new_start_iso):
+    df = st.session_state.plan_df
+    mask = df["id"] == order_id
+    if not mask.any():
+        raise ValueError(f"Order {order_id} not found.")
+    new_start = dtparser.isoparse(new_start_iso).astimezone(APP_TZ)
+    durations = (df.loc[mask, "finish"] - df.loc[mask, "start"]).dt.total_seconds()
+    duration = timedelta(seconds=float(durations.iloc[0]))
+    df.loc[mask, "start"] = new_start
+    df.loc[mask, "finish"] = new_start + duration
+
+def shift_range_by(filter_dict, delta_days=0, delta_hours=0, delta_minutes=0):
+    df = st.session_state.plan_df
+    m = pd.Series(True, index=df.index)
+    if filter_dict.get("orderIds"):
+        m &= df["id"].isin(filter_dict["orderIds"])
+    if filter_dict.get("resourceIds"):
+        m &= df["resource"].isin(filter_dict["resourceIds"])
+    if filter_dict.get("dateRange"):
+        s = dtparser.isoparse(filter_dict["dateRange"]["startISO"]).astimezone(APP_TZ)
+        e = dtparser.isoparse(filter_dict["dateRange"]["endISO"]).astimezone(APP_TZ)
+        m &= (df["start"] < e) & (df["finish"] > s)
+    if not m.any():
+        raise ValueError("No tasks match the given range filter.")
+    delta = relativedelta(days=delta_days, hours=delta_hours, minutes=delta_minutes)
+    df.loc[m, "start"] = df.loc[m, "start"].apply(lambda x: x + delta)
+    df.loc[m, "finish"] = df.loc[m, "finish"].apply(lambda x: x + delta)
+
+# ----------------------------
+# OpenAI prompts & tool schema
+# ----------------------------
+SYSTEM_PROMPT = """
+You convert user scheduling commands into STRICT JSON operations for a Gantt planner.
+You MUST return ONLY a JSON object with an "operations" array. Do not add prose.
+Timezone: Asia/Makassar. Today is {today}.
+
+Allowed operation shapes:
+1) move_order_by:
+{{
+  "type": "move_order_by",
+  "orderId": "O023",
+  "delta": {{"days": 1, "hours": 0, "minutes": 0}}
+}}
+2) move_order_to:
+{{
+  "type": "move_order_to",
+  "orderId": "O023",
+  "start": "2025-08-25T09:00:00+08:00"
+}}
+3) shift_range_by:
+{{
+  "type": "shift_range_by",
+  "filter": {{
+    "resourceIds": ["Line A"],
+    "orderIds": ["O021","O022"],
+    "dateRange": {{"startISO":"2025-08-22T00:00:00+08:00","endISO":"2025-08-22T23:59:59+08:00"}}
+  }},
+  "delta": {{"hours": 2}}
+}}
+4) undo:
+{{ "type": "undo", "steps": 1 }}
+5) redo:
+{{ "type": "redo", "steps": 1 }}
+
+Rules:
+- Resolve relative dates like "tomorrow" using the timezone above.
+- Only reference known order IDs/resources when possible (see context).
+- If the user requests a single shift like "move O023 by one day", produce a single operation.
+- Keep numbers integers where possible.
+"""
+
+def build_context_snapshot(df: pd.DataFrame):
+    # Small index of known entities to guide the model
+    resources = sorted(df["resource"].dropna().unique().tolist())
+    orders = df["id"].tolist()
+    bounds = {
+        "minStart": df["start"].min().isoformat(),
+        "maxFinish": df["finish"].max().isoformat(),
+    }
+    return {"orders": orders, "resources": resources, "bounds": bounds, "today": str(TODAY)}
+
+def interpret_with_llm(transcript: str, context_snapshot: dict) -> list[dict]:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT.format(today=str(TODAY))},
+        {"role": "user", "content": f"Context: {json.dumps(context_snapshot)}"},
+        {"role": "user", "content": f'Command: """{transcript}"""'},
+    ]
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+    content = resp.choices[0].message.content
+    data = json.loads(content)
+    ops = data.get("operations", [])
+    if not isinstance(ops, list):
+        raise ValueError("LLM did not return a valid operations array.")
+    return ops
+
+# ----------------------------
+# Whisper transcription
+# ----------------------------
+def transcribe_with_whisper(wav_bytes: bytes, language_hint: str | None = None) -> dict:
+    # Save to a NamedTemporaryFile for the SDK
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(wav_bytes)
+        tmp.flush()
+        tmp_path = tmp.name
+    try:
+        with open(tmp_path, "rb") as f:
+            tr = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language=language_hint  # None lets Whisper autodetect
+            )
+        return {"text": tr.text}
+    finally:
         try:
-            dt = dtp.parse(when, fuzzy=True)
-            return {
-                "intent": "move_order",
-                "order_id": oid,
-                "date": dt.date().isoformat(),
-                "time": dt.strftime("%H:%M"),
-                "_source": "regex",
-            }
+            os.remove(tmp_path)
         except Exception:
             pass
 
-    # Simple fallback: "one day"
-    m = re.search(r"(delay|push|postpone)\s+(o\d{3}).*\b(one)\s+day\b", low_norm)
-    if m:
-        return {"intent": "delay_order", "order_id": m.group(2).upper(), "days": delay_sign * 1, "_source": "regex"}
+# ----------------------------
+# UI helpers
+# ----------------------------
+def render_gantt(df: pd.DataFrame):
+    fig = px.timeline(
+        df.sort_values("start"),
+        x_start="start",
+        x_end="finish",
+        y="resource",
+        color="id",
+        hover_data=["id", "resource", "start", "finish"],
+    )
+    fig.update_yaxes(autorange="reversed")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True})
 
-    return {"intent": "unknown", "raw": user_text, "_source": "regex"}
-
-def extract_intent(user_text: str) -> dict:
+def apply_operations(ops: list[dict]) -> list[str]:
+    """
+    Apply a list of operations atomically (simple version).
+    Returns a list of human-readable summaries for the toast/log.
+    """
+    if not ops:
+        return ["No operations to apply."]
+    # Snapshot for undo
+    snapshot()
+    msgs = []
     try:
-        if os.getenv("OPENAI_API_KEY"):
-            return _extract_with_openai(user_text)
-    except Exception:
-        pass
-    return _regex_fallback(user_text)
+        for op in ops:
+            t = op.get("type")
+            if t == "move_order_by":
+                oid = op["orderId"]
+                delta = op.get("delta", {})
+                move_order_by(oid,
+                              delta_days=int(delta.get("days", 0)),
+                              delta_hours=int(delta.get("hours", 0)),
+                              delta_minutes=int(delta.get("minutes", 0)))
+                msgs.append(f"Moved {oid} by {delta.get('days',0)}d {delta.get('hours',0)}h {delta.get('minutes',0)}m")
 
-def validate_intent(payload: dict, orders_df, sched_df):
-    intent = payload.get("intent")
+            elif t == "move_order_to":
+                oid = op["orderId"]
+                start_iso = op["start"]
+                move_order_to(oid, start_iso)
+                msgs.append(f"Moved {oid} to {start_iso}")
 
-    def order_exists(oid):
-        return oid and (orders_df["order_id"] == oid).any()
+            elif t == "shift_range_by":
+                fdict = op.get("filter", {})
+                delta = op.get("delta", {})
+                shift_range_by(fdict,
+                               delta_days=int(delta.get("days", 0)),
+                               delta_hours=int(delta.get("hours", 0)),
+                               delta_minutes=int(delta.get("minutes", 0)))
+                msgs.append("Shifted range by "
+                            f"{delta.get('days',0)}d {delta.get('hours',0)}h {delta.get('minutes',0)}m")
 
-    if intent not in ("delay_order", "move_order", "swap_orders"):
-        return False, "Unsupported intent"
+            elif t == "undo":
+                steps = int(op.get("steps", 1))
+                do_undo(steps)
+                msgs.append(f"Undid {steps} step(s)")
 
-    if intent in ("delay_order", "move_order", "swap_orders"):
-        oid = payload.get("order_id")
-        if not order_exists(oid):
-            return False, f"Unknown order_id: {oid}"
+            elif t == "redo":
+                steps = int(op.get("steps", 1))
+                do_redo(steps)
+                msgs.append(f"Redid {steps} step(s)")
 
-    if intent == "swap_orders":
-        oid2 = payload.get("order_id_2")
-        if not order_exists(oid2):
-            return False, f"Unknown order_id_2: {oid2}"
-        if oid2 == payload.get("order_id"):
-            return False, "Cannot swap the same order."
-        return True, "ok"
-
-    if intent == "delay_order":
-        # normalize numbers and allow minutes
-        for k in ("days","hours","minutes"):
-            if k in payload and payload[k] is not None:
-                try:
-                    payload[k] = float(payload[k])
-                except Exception:
-                    return False, f"{k.capitalize()} must be numeric."
-        if not any(payload.get(k) for k in ("days","hours","minutes")):
-            return False, "Delay needs a duration (days/hours/minutes)."
-        return True, "ok"
-
-    if intent == "move_order":
-        date_str = payload.get("date")
-        hhmm = payload.get("time") or "08:00"
-        if not date_str:
-            return False, "Move needs a date."
-        try:
-            dt = dtp.parse(f"{date_str} {hhmm}")
-            if dt.tzinfo is None:
-                dt = TZ.localize(dt)
             else:
-                dt = dt.astimezone(TZ)
-            payload["_target_dt"] = dt
-        except Exception:
-            return False, f"Unparseable datetime: {date_str} {hhmm}"
-        return True, "ok"
-
-    return False, "Invalid payload"
-
-# ============================ APPLY FUNCTIONS =========================
-def _repack_touched_machines(s: pd.DataFrame, touched_orders):
-    machines = s.loc[s["order_id"].isin(touched_orders), "machine"].unique().tolist()
-    for m in machines:
-        block_idx = s.index[s["machine"] == m]
-        block = s.loc[block_idx].sort_values(["start", "end"]).copy()
-        last_end = None
-        for idx, row in block.iterrows():
-            if last_end is not None and row["start"] < last_end:
-                dur = row["end"] - row["start"]
-                s.at[idx, "start"] = last_end
-                s.at[idx, "end"] = last_end + dur
-            last_end = s.at[idx, "end"]
-    return s
-
-def apply_delay(schedule_df: pd.DataFrame, order_id: str, days=0, hours=0, minutes=0):
-    s = schedule_df.copy()
-    delta = timedelta(days=float(days or 0), hours=float(hours or 0), minutes=float(minutes or 0))
-    mask = s["order_id"] == order_id
-    s.loc[mask, "start"] = s.loc[mask, "start"] + delta
-    s.loc[mask, "end"]   = s.loc[mask, "end"]   + delta
-    return _repack_touched_machines(s, [order_id])
-
-def apply_move(schedule_df: pd.DataFrame, order_id: str, target_dt):
-    s = schedule_df.copy()
-    t0 = s.loc[s["order_id"] == order_id, "start"].min()
-    delta = target_dt - t0
-    days = delta.days
-    hours = delta.seconds // 3600
-    minutes = (delta.seconds % 3600) // 60
-    return apply_delay(s, order_id, days=days, hours=hours, minutes=minutes)
-
-def apply_swap(schedule_df: pd.DataFrame, a: str, b: str):
-    s = schedule_df.copy()
-    a0 = s.loc[s["order_id"] == a, "start"].min()
-    b0 = s.loc[s["order_id"] == b, "start"].min()
-    da, db = (b0 - a0), (a0 - b0)
-    s = apply_delay(s, a, days=da.days, hours=da.seconds // 3600, minutes=(da.seconds % 3600)//60)
-    s = apply_delay(s, b, days=db.days, hours=db.seconds // 3600, minutes=(db.seconds % 3600)//60)
-    return s
-
-# ============================ FILTER & CHART =========================
-sched = st.session_state.schedule_df.copy()
-sched = sched[sched["wheel_type"].isin(wheel_choice)]
-sched = sched[sched["machine"].isin(machine_choice)]
-order_priority = sched.groupby("order_id", as_index=False)["start"].min().sort_values("start")
-keep_ids = order_priority["order_id"].head(max_orders).tolist()
-sched = sched[sched["order_id"].isin(keep_ids)].copy()
-
-if sched.empty:
-    st.info("No operations match the current filters.")
-else:
-    color_map = {
-        "Urban-200": "#1f77b4",
-        "Offroad-250": "#ff7f0e",
-        "Racing-180": "#2ca02c",
-        "HeavyDuty-300": "#d62728",
-        "Eco-160": "#9467bd",
-    }
-    domain = list(color_map.keys())
-    range_ = [color_map[k] for k in domain]
-
-    select_order = alt.selection_point(fields=["order_id"], on="click", clear="dblclick")
-    y_machines_sorted = sorted(sched["machine"].unique().tolist())
-
-    base_enc = {
-        "y": alt.Y("machine:N", sort=y_machines_sorted, title=None),
-        "x": alt.X("start:T", title=None, axis=alt.Axis(format="%a %b %d")),
-        "x2": "end:T",
-    }
-
-    bars = alt.Chart(sched).mark_bar(cornerRadius=3).encode(
-        color=alt.condition(
-            select_order,
-            alt.Color("wheel_type:N", scale=alt.Scale(domain=domain, range=range_), legend=None),
-            alt.value("#dcdcdc"),
-        ),
-        opacity=alt.condition(select_order, alt.value(1.0), alt.value(0.25)),
-        tooltip=[
-            alt.Tooltip("order_id:N", title="Order"),
-            alt.Tooltip("operation:N", title="Operation"),
-            alt.Tooltip("sequence:Q", title="Seq"),
-            alt.Tooltip("machine:N", title="Machine"),
-            alt.Tooltip("start:T", title="Start"),
-            alt.Tooltip("end:T", title="End"),
-            alt.Tooltip("due_date:T", title="Due"),
-            alt.Tooltip("wheel_type:N", title="Wheel"),
-        ],
-    )
-
-    labels = alt.Chart(sched).mark_text(
-        align="left", dx=6, baseline="middle", fontSize=10, color="white"
-    ).encode(
-        text="order_id:N",
-        opacity=alt.condition(select_order, alt.value(1.0), alt.value(0.7)),
-    )
-
-    gantt = (
-        alt.layer(bars, labels, data=sched)
-        .encode(**base_enc)
-        .add_params(select_order)
-        .properties(width="container", height=520)
-        .configure_view(stroke=None)
-    )
-    st.altair_chart(gantt, use_container_width=True)
-
-# ============================ INTELLIGENCE INPUT (single keyed instance) =========================
-user_cmd = st.chat_input("Type a command (delay/move/swap)…", key="cmd_input")
-
-if user_cmd:
-    try:
-        payload = extract_intent(user_cmd)
-        ok, msg = validate_intent(payload, orders, st.session_state.schedule_df)
-
-        # log it (json-safe)
-        log_payload = dict(payload)
-        if "_target_dt" in log_payload:
-            log_payload["_target_dt"] = str(log_payload["_target_dt"])
-        st.session_state.cmd_log.append({
-            "raw": user_cmd,
-            "payload": log_payload,
-            "ok": bool(ok),
-            "msg": msg,
-            "source": payload.get("_source", "?")
-        })
-        st.session_state.cmd_log = st.session_state.cmd_log[-50:]
-
-        if not ok:
-            st.error(f"❌ Cannot apply: {msg}")
-        else:
-            if payload["intent"] == "delay_order":
-                st.session_state.schedule_df = apply_delay(
-                    st.session_state.schedule_df,
-                    payload["order_id"],
-                    days=payload.get("days", 0),
-                    hours=payload.get("hours", 0),
-                    minutes=payload.get("minutes", 0),
-                )
-                st.success(f"✅ Delayed {payload['order_id']}.")
-
-            elif payload["intent"] == "move_order":
-                st.session_state.schedule_df = apply_move(
-                    st.session_state.schedule_df,
-                    payload["order_id"],
-                    payload["_target_dt"],
-                )
-                st.success(f"✅ Moved {payload['order_id']}.")
-
-            elif payload["intent"] == "swap_orders":
-                st.session_state.schedule_df = apply_swap(
-                    st.session_state.schedule_df,
-                    payload["order_id"],
-                    payload["order_id_2"],
-                )
-                st.success(f"✅ Swapped {payload['order_id']} and {payload['order_id_2']}.")
-
-            st.rerun()
-
+                raise ValueError(f"Unknown operation type: {t}")
+        return msgs
     except Exception as e:
-        st.error(f"⚠️ Error: {e}")
+        # Roll back if something fails by undoing the snapshot we just pushed
+        do_undo(1)
+        raise e
+
+# ----------------------------
+# App
+# ----------------------------
+st.title("🎙️ Voice → Gantt (Whisper + LLM)")
+
+with st.sidebar:
+    st.markdown("### Voice settings")
+    lang = st.selectbox("Language hint (optional)", ["auto", "en", "id", "de", "fr", "es"], index=0)
+    st.caption("If set to 'auto', Whisper will detect the language.")
+    st.divider()
+    if st.button("Undo"):
+        if do_undo(1):
+            st.success("Undid last change.")
+        else:
+            st.info("Nothing to undo.")
+    if st.button("Redo"):
+        if do_redo(1):
+            st.success("Redid change.")
+        else:
+            st.info("Nothing to redo.")
+    st.divider()
+    st.markdown("**What can I say?**")
+    st.code('''
+"move Order O023 by one day"
+"move O023 to Aug 25 09:00"
+"shift all on Line A today by 2 hours"
+"undo"
+'''.strip())
+
+init_history()
+df = load_plan_dataframe()
+render_gantt(df)
+
+st.markdown("#### Speak a command")
+st.caption("Click to record, click again to stop. Review the transcript, then Apply.")
+audio = mic_recorder(
+    start_prompt="Start recording",
+    stop_prompt="Stop",
+    just_once=False,
+    use_container_width=True,
+    format="wav",
+    key="mic",
+)
+
+col1, col2 = st.columns([1,1])
+
+with col1:
+    transcript_area = st.empty()
+with col2:
+    ops_area = st.empty()
+
+transcript_text = ""
+
+if audio and isinstance(audio, dict) and audio.get("bytes"):
+    # audio["bytes"] is raw WAV bytes from the component
+    wav_bytes = audio["bytes"]
+
+    # Ensure valid WAV by decoding/encoding once via soundfile
+    data, samplerate = sf.read(io.BytesIO(wav_bytes))
+    buf = io.BytesIO()
+    sf.write(buf, data, samplerate, format="WAV")
+    clean_wav_bytes = buf.getvalue()
+
+    with st.spinner("Transcribing with Whisper..."):
+        tr = transcribe_with_whisper(clean_wav_bytes, None if lang == "auto" else lang)
+        transcript_text = tr["text"].strip()
+        transcript_area.text_area("Transcript", transcript_text, height=120)
+
+    if transcript_text:
+        with st.spinner("Interpreting command..."):
+            ctx = build_context_snapshot(st.session_state.plan_df)
+            try:
+                ops = interpret_with_llm(transcript_text, ctx)
+                ops_area.json({"operations": ops})
+                if st.button("Apply to plan", type="primary"):
+                    try:
+                        msgs = apply_operations(ops)
+                        st.success(" | ".join(msgs))
+                        render_gantt(st.session_state.plan_df)
+                    except Exception as e:
+                        st.error(str(e))
+            except Exception as e:
+                st.error(f"Could not interpret the command: {e}")
+
+# Manual testing without mic
+st.markdown("#### Or type a command (debug)")
+manual = st.text_input("Try: move O023 by one day")
+if st.button("Interpret (typed)"):
+    if not manual.strip():
+        st.warning("Type something first.")
+    else:
+        ctx = build_context_snapshot(st.session_state.plan_df)
+        try:
+            ops = interpret_with_llm(manual.strip(), ctx)
+            ops_area.json({"operations": ops})
+        except Exception as e:
+            st.error(f"Could not interpret: {e}")
+
