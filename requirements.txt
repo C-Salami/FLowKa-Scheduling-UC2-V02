@@ -7,3 +7,13 @@ altair==5.3.0
 openai>=1.40.0
 python-dateutil>=2.9.0.post0
 pytz>=2024.1
+
+streamlit==1.37.0
+streamlit-mic-recorder==0.0.8
+plotly==5.22.0
+pandas==2.2.2
+python-dateutil==2.9.0.post0
+openai==1.35.10
+numpy==1.26.4
+soundfile==0.12.1
+
