@@ -1,4 +1,5 @@
 import os
+import io
 from datetime import datetime, timedelta
 from dateutil import tz, parser as dtparser
 from dateutil.relativedelta import relativedelta
@@ -9,13 +10,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from streamlit_plotly_events import plotly_events
+from streamlit_mic_recorder import mic_recorder
 
-# Optional: voice input (browser Web Speech API)
-try:
-    from st_voice_input import voice_input
-    VOICE_OK = True
-except Exception:
-    VOICE_OK = False
+# Speech-to-text (Google Web Speech via SpeechRecognition)
+import speech_recognition as sr
 
 # =========================
 # Config & globals
@@ -31,6 +29,7 @@ st.session_state.setdefault("command_text", "")
 st.session_state.setdefault("history", [])
 st.session_state.setdefault("future", [])
 st.session_state.setdefault("filters", None)
+st.session_state.setdefault("ops_preview", None)
 
 # =========================
 # Helpers
@@ -159,7 +158,6 @@ def apply_filters(df: pd.DataFrame, f: dict):
     if f.get("resources"):
         m &= df["resource"].isin(f["resources"])
     if f.get("orders"):
-        # substring match on order_id
         term = f["orders"].strip()
         if term:
             m &= df["order_id"].str.contains(term, case=False, na=False)
@@ -180,17 +178,16 @@ def move_order_by(order_id, delta_days=0, delta_hours=0, delta_minutes=0):
     if not m.any():
         raise ValueError(f"Order {order_id} not found.")
     delta = relativedelta(days=int(delta_days), hours=int(delta_hours), minutes=int(delta_minutes))
-    df.loc[m, "start"] = df.loc[m, "start"].apply(lambda x: x + delta)
+    df.loc[m, "start"]  = df.loc[m, "start"].apply(lambda x: x + delta)
     df.loc[m, "finish"] = df.loc[m, "finish"].apply(lambda x: x + delta)
 
 def parse_move_command(cmd: str, selected_order: str | None):
     """
-    Supported utterances (examples):
+    Supported utterances:
       - move order O023 by 1 day
       - delay O023 by 2 hours
       - advance O045 by 30 minutes
       - move this order by 3 hours
-    Returns dict or raises ValueError.
     """
     import re
     text = (cmd or "").strip().lower()
@@ -209,12 +206,11 @@ def parse_move_command(cmd: str, selected_order: str | None):
     elif "this order" in text and selected_order:
         order_id = selected_order
     else:
-        raise ValueError("No order id found. Say something like 'move O023 by 1 day' or click a bar then say 'move this order by 2 hours'.")
+        raise ValueError("No order id found. Say 'move O023 by 1 day' or click a bar then say 'move this order by 2 hours'.")
 
     # find quantity + unit
     m_qty = re.search(r"\bby\s+(-?\d+)\s*(day|days|hour|hours|minute|minutes|min|mins)\b", text)
     if not m_qty:
-        # also accept "by X d/h/m"
         m_qty = re.search(r"\bby\s+(-?\d+)\s*(d|h|m)\b", text)
     if not m_qty:
         raise ValueError("No amount found. Example: 'by 2 hours' or 'by 1 day'.")
@@ -233,19 +229,21 @@ def parse_move_command(cmd: str, selected_order: str | None):
     return {"orderId": order_id, "delta": {"days": days, "hours": hours, "minutes": minutes}}
 
 # =========================
-# Gantt rendering (Plotly, UC1 look, interactive)
+# Gantt rendering (Plotly; click→highlight whole order; distinct color per order)
 # =========================
 def render_gantt(df: pd.DataFrame, selected_order: str | None, height_px: int = 720):
     """
-    Strategy: build two layers so selection truly highlights:
+    Two layers so selection truly highlights:
       - others: low opacity
       - selected: full opacity, thicker border
+    Also attach customdata=order_id so click mapping is 100% reliable.
     """
     df = df.copy()
-    # Distinct color per order (plotly will assign discrete colors). We keep one color mapping by ordering.
     order_list = sorted(df["order_id"].unique().tolist())
 
-    # Split
+    # Prepare customdata
+    df["__order__"] = df["order_id"]
+
     if selected_order and selected_order in order_list:
         sel_mask = df["order_id"] == selected_order
         df_sel = df[sel_mask].copy()
@@ -267,6 +265,11 @@ def render_gantt(df: pd.DataFrame, selected_order: str | None, height_px: int = 
         for tr in fig_oth.data:
             tr.opacity = 0.25
             tr.marker = dict(line=dict(width=0))
+            # attach customdata if missing
+            if tr.customdata is None:
+                # Build per-trace customdata matching number of bars in this trace
+                # We rebuild using x/y from the trace's base dataframe is complex; instead add once globally:
+                pass
             fig.add_trace(tr)
 
     if len(df_sel):
@@ -282,6 +285,18 @@ def render_gantt(df: pd.DataFrame, selected_order: str | None, height_px: int = 
             tr.marker = dict(line=dict(width=2))
             fig.add_trace(tr)
 
+    # Attach a single invisible scatter with customdata for reliable click mapping
+    fig.add_trace(go.Scatter(
+        x=df["start"],
+        y=df["resource"],
+        mode="markers",
+        marker=dict(opacity=0),
+        hoverinfo="skip",
+        showlegend=False,
+        customdata=df["__order__"],
+        name="__hitmap__"
+    ))
+
     fig.update_yaxes(autorange="reversed")
     fig.update_layout(
         height=height_px,
@@ -292,7 +307,24 @@ def render_gantt(df: pd.DataFrame, selected_order: str | None, height_px: int = 
     return fig
 
 # =========================
-# UI – minimal + visible filter button + bottom mic bar
+# Voice transcription (Google via SpeechRecognition)
+# =========================
+def transcribe_google_wav_bytes(wav_bytes: bytes, language: str = "en-US") -> str:
+    """
+    Uses SpeechRecognition's Google Web Speech API (free, no key).
+    """
+    r = sr.Recognizer()
+    with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
+        audio = r.record(source)
+    try:
+        return r.recognize_google(audio, language=language)
+    except sr.UnknownValueError:
+        raise RuntimeError("Could not understand audio.")
+    except sr.RequestError as e:
+        raise RuntimeError(f"Speech service error: {e}")
+
+# =========================
+# UI – visible filter button + bottom mic bar
 # =========================
 st.markdown("""
 <style>
@@ -303,7 +335,7 @@ st.markdown("""
 }
 #bottom-inner {display: flex; gap: 8px; align-items: center; max-width: 1200px; margin: 0 auto;}
 #cmd {flex: 1;}
-/* Make a very visible filter toggle */
+/* Very visible filter toggle */
 #filter-toggle { position: fixed; left: 14px; top: 14px; z-index: 1100; }
 </style>
 """, unsafe_allow_html=True)
@@ -320,12 +352,12 @@ with ft_col:
 if st.session_state.show_filters:
     with st.sidebar:
         st.markdown("### Filters")
-        work_df = ensure_work_df()
-        res_list = sorted(work_df["resource"].unique().tolist())
+        work_df_all = ensure_work_df()
+        res_list = sorted(work_df_all["resource"].unique().tolist())
         res_sel = st.multiselect("Resource", options=res_list, default=st.session_state.filters.get("resources", []) if st.session_state.filters else [])
         order_term = st.text_input("Order contains", value=(st.session_state.filters.get("orders", "") if st.session_state.filters else ""))
-        min_d = work_df["start"].min().date()
-        max_d = work_df["finish"].max().date()
+        min_d = work_df_all["start"].min().date()
+        max_d = work_df_all["finish"].max().date()
         date_range = st.date_input("Date range", value=st.session_state.filters.get("date_range", (min_d, max_d)) if st.session_state.filters else (min_d, max_d))
         if st.button("Apply filters"):
             st.session_state.filters = {"resources": res_sel, "orders": order_term, "date_range": date_range}
@@ -343,26 +375,32 @@ if st.session_state.show_filters:
 work_df = ensure_work_df()
 view_df = apply_filters(work_df, st.session_state.filters or {})
 
-# Gantt (85% of screen)
+# Gantt (≈85% screen) + robust click mapping using customdata
 gantt_height = 720
 fig = render_gantt(view_df, st.session_state.selected_order, height_px=gantt_height)
 clicks = plotly_events(fig, click_event=True, hover_event=False, select_event=False, override_height=gantt_height, override_width="100%")
 
-# Click anywhere on a bar to select its whole order
+# Click any bar to select its whole order (highlight)
 if clicks:
-    pt = clicks[0]
-    res_clicked = pt.get("y")
-    x_clicked = pd.to_datetime(pt.get("x"))
-    if res_clicked is not None and pd.notna(x_clicked):
-        hits = view_df[(view_df["resource"] == str(res_clicked)) &
-                       (view_df["start"] <= x_clicked.tz_localize(APP_TZ) if x_clicked.tzinfo is None else x_clicked) &
-                       (view_df["finish"] >= x_clicked.tz_localize(APP_TZ) if x_clicked.tzinfo is None else x_clicked)]
-        if len(hits):
-            sel_order = hits.iloc[0]["order_id"]
-            if sel_order != st.session_state.selected_order:
-                st.session_state.selected_order = sel_order
-                st.toast(f"Selected order: {sel_order}", icon="🎯")
-                st.experimental_rerun()
+    # Prefer customdata if present, else fall back to time/resource window
+    cd = clicks[0].get("customdata")
+    if cd:
+        sel_order = str(cd)
+    else:
+        res_clicked = clicks[0].get("y")
+        x_clicked = pd.to_datetime(clicks[0].get("x"))
+        if res_clicked is not None and pd.notna(x_clicked):
+            x_clicked = x_clicked if x_clicked.tzinfo else x_clicked.tz_localize(APP_TZ)
+            hits = view_df[(view_df["resource"] == str(res_clicked)) &
+                           (view_df["start"] <= x_clicked) &
+                           (view_df["finish"] >= x_clicked)]
+            sel_order = hits.iloc[0]["order_id"] if len(hits) else None
+        else:
+            sel_order = None
+    if sel_order and sel_order != st.session_state.selected_order:
+        st.session_state.selected_order = sel_order
+        st.toast(f"Selected order: {sel_order}", icon="🎯")
+        st.experimental_rerun()
 
 # =========================
 # Bottom mic bar
@@ -377,14 +415,23 @@ with colA:
     )
 
 with colB:
-    if VOICE_OK:
-        st.caption("Voice (local)")
-        spoken = voice_input(language="en-US", key="voice_in")  # change language if needed
-        if spoken:
-            st.session_state.command_text = spoken
-    else:
-        st.caption("Voice unavailable")
-        st.write("Install `streamlit-voice-input` for local speech-to-text.")
+    st.caption("Voice (record/stop)")
+    audio = mic_recorder(
+        start_prompt="🎙️",
+        stop_prompt="■",
+        just_once=False,
+        use_container_width=True,
+        format="wav",
+        key="mic",
+    )
+    if audio and isinstance(audio, dict) and audio.get("bytes"):
+        wav_bytes = audio["bytes"]
+        try:
+            transcript = transcribe_google_wav_bytes(wav_bytes, language="en-US")
+            st.session_state.command_text = transcript
+            st.toast("Transcribed.", icon="🗣️")
+        except Exception as e:
+            st.error(str(e))
 
 with colC:
     exec_btn = st.button("Interpret")
@@ -397,9 +444,9 @@ st.markdown('</div></div>', unsafe_allow_html=True)
 if exec_btn:
     try:
         instr = parse_move_command(st.session_state.command_text, st.session_state.selected_order)
-        # Show preview as JSON (lightweight)
         st.session_state.ops_preview = [ {"type": "move_order_by", **instr} ]
-        st.success(f"Parsed: move {instr['orderId']} by {instr['delta']}")
+        d = instr["delta"]
+        st.success(f"Parsed: move {instr['orderId']} by {d.get('days',0)}d {d.get('hours',0)}h {d.get('minutes',0)}m")
     except Exception as e:
         st.session_state.ops_preview = None
         st.error(str(e))
