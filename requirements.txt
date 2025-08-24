@@ -1,8 +1,9 @@
 streamlit==1.37.1
-streamlit-mic-recorder==0.0.8
 plotly==5.24.1
 pandas==2.2.2
 numpy==1.26.4
 python-dateutil==2.9.0.post0
 openai>=1.40.0,<2
 soundfile==0.12.1
+streamlit-mic-recorder==0.0.8
+streamlit-plotly-events==0.0.6
