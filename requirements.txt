@@ -6,4 +6,5 @@ python-dateutil==2.9.0.post0
 altair==5.3.0
 pytz>=2024.1
 streamlit-plotly-events==0.0.6
-streamlit-voice-input==0.3.1
+streamlit-mic-recorder==0.0.8
+SpeechRecognition==3.10.4
